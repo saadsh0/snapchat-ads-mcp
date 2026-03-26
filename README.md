@@ -88,7 +88,7 @@ pip install -r requirements.txt
 
 1. Go to [business.snapchat.com](https://business.snapchat.com)
 2. Navigate to **Business Details → OAuth Apps → New App**
-3. Set redirect URI to `http://localhost:8080`
+3. Set redirect URI to `https://example.com`
 4. Copy your **Client ID** and **Client Secret**
 
 > ⚠️ Use **Business Manager** to create the app — NOT the Developer Portal
@@ -108,7 +108,7 @@ Or create a `.env` file (see `.env.example`).
 python auth_setup.py
 ```
 
-This opens Snapchat in your browser → you click Allow → tokens are saved automatically. No copy-pasting. Never needed again.
+This opens Snapchat in your browser → you click Allow → you paste the redirect URL → tokens saved automatically. Never needed again.
 
 ### Step 5 — Connect to Claude Desktop
 
