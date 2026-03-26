@@ -2,6 +2,10 @@
 """
 Snapchat Ads MCP Server
 Analyze campaign performance and take actions on Snapchat Ads via Claude.
+
+Multi-client support: set SNAPCHAT_CONFIG_FILE env var to point to a
+specific client's config.json. Org is locked to the org_id saved in that
+config file, preventing cross-client data access.
 """
 
 import asyncio
@@ -21,12 +25,56 @@ CLIENT_ID     = os.environ.get("SNAPCHAT_CLIENT_ID",     "")
 CLIENT_SECRET = os.environ.get("SNAPCHAT_CLIENT_SECRET", "")
 API_BASE      = "https://adsapi.snapchat.com/v1"
 TOKEN_URL     = "https://accounts.snapchat.com/login/oauth2/access_token"
-CONFIG_FILE   = os.path.join(os.path.dirname(__file__), "config.json")
+
+# Config file: env var takes priority (enables per-client isolation),
+# falls back to config.json next to server.py
+CONFIG_FILE = os.environ.get(
+    "SNAPCHAT_CONFIG_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+)
+
+# ── Cache (in-memory, 5-min TTL for read operations) ─────────────────────────
+_cache: dict[str, tuple[float, str]] = {}
+CACHE_TTL = 300  # seconds
+
+
+def cache_get(key: str) -> Optional[str]:
+    entry = _cache.get(key)
+    if entry and entry[0] > time.time():
+        return entry[1]
+    return None
+
+
+def cache_set(key: str, value: str) -> None:
+    _cache[key] = (time.time() + CACHE_TTL, value)
+
+
+def cache_invalidate(ad_account_id: str) -> None:
+    """Clear all cached responses for a specific account after a write action."""
+    stale = [k for k in _cache if ad_account_id in k]
+    for k in stale:
+        del _cache[k]
+
+
+# ── Rate Limiter (30 requests per minute) ────────────────────────────────────
+_request_times: list[float] = []
+_rate_lock = asyncio.Lock()
+RATE_LIMIT_PER_MINUTE = 30
+
+
+async def _rate_limit():
+    async with _rate_lock:
+        now = time.time()
+        _request_times[:] = [t for t in _request_times if now - t < 60]
+        if len(_request_times) >= RATE_LIMIT_PER_MINUTE:
+            wait = 60 - (now - _request_times[0]) + 0.5
+            await asyncio.sleep(wait)
+        _request_times.append(time.time())
+
 
 # ── Token Management ─────────────────────────────────────────────────────────
-# Bug 2 fix: asyncio.Lock prevents race condition when multiple tools
-# are called concurrently and the token has expired simultaneously.
 _token_lock = asyncio.Lock()
+
 
 def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
@@ -34,17 +82,28 @@ def load_config() -> dict:
             return json.load(f)
     return {}
 
+
 def save_config(cfg: dict) -> None:
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
+
+
+def get_org_id() -> str:
+    """Returns the locked org ID — from config.json (set during auth_setup)."""
+    return load_config().get("org_id", "")
+
 
 async def get_access_token() -> str:
     async with _token_lock:
         cfg = load_config()
-        # Token still valid?
+        if not cfg:
+            raise RuntimeError(
+                f"No config found at {CONFIG_FILE}. "
+                "Run auth_setup.py first (or auth_setup.py --client <name> for agency use)."
+            )
         if cfg.get("access_token") and cfg.get("expires_at", 0) > time.time() + 60:
             return cfg["access_token"]
-        # Refresh
         if cfg.get("refresh_token"):
             async with httpx.AsyncClient() as c:
                 r = await c.post(TOKEN_URL, data={
@@ -61,11 +120,13 @@ async def get_access_token() -> str:
                 save_config(cfg)
                 return cfg["access_token"]
         raise RuntimeError(
-            "No tokens found. Run auth_setup.py first to authorise your Snapchat account."
+            "No tokens found. Run auth_setup.py to authorise your Snapchat account."
         )
+
 
 # ── API Helpers ───────────────────────────────────────────────────────────────
 async def snap_request(endpoint: str, method: str = "GET", **kwargs) -> dict:
+    await _rate_limit()
     token = await get_access_token()
     async with httpx.AsyncClient() as c:
         r = await c.request(
@@ -78,11 +139,9 @@ async def snap_request(endpoint: str, method: str = "GET", **kwargs) -> dict:
         r.raise_for_status()
         return r.json()
 
+
 async def snap_request_all(endpoint: str, list_key: str) -> list:
-    """
-    Bug 3 fix: Paginated fetch — follows paging.next_link until all
-    pages are retrieved. Works for campaigns, adsquads, ads, creatives.
-    """
+    """Paginated fetch — follows paging.next_link until all pages are retrieved."""
     results = []
     url = f"{API_BASE}/{endpoint}"
     token = await get_access_token()
@@ -90,21 +149,18 @@ async def snap_request_all(endpoint: str, list_key: str) -> list:
 
     async with httpx.AsyncClient() as c:
         while url:
+            await _rate_limit()
             r = await c.get(url, headers=headers, timeout=30.0)
             r.raise_for_status()
             data = r.json()
             results.extend(data.get(list_key, []))
-            # Follow next page if present
             url = data.get("paging", {}).get("next_link")
 
     return results
 
+
 # ── Error Handler ─────────────────────────────────────────────────────────────
 def err(e: Exception) -> str:
-    """
-    Bug 4 fix: Parse JSON error body and extract nested human-readable
-    message before falling back to raw text truncation.
-    """
     if isinstance(e, httpx.HTTPStatusError):
         code = e.response.status_code
         if code == 401:
@@ -114,11 +170,9 @@ def err(e: Exception) -> str:
         if code == 404:
             return "Error 404: Not found. Verify the ID is correct."
         if code == 429:
-            return "Error 429: Rate limit hit. Wait a moment and retry."
-        # Try to extract nested Snapchat error message
+            return "Error 429: Rate limit hit. Waiting and will retry on next call."
         try:
             body = e.response.json()
-            # Snapchat nests errors at: body -> errors -> [0] -> message
             errors = body.get("errors") or body.get("debug_message") or body.get("display_message")
             if isinstance(errors, list) and errors:
                 msg = errors[0].get("message", str(errors[0]))
@@ -131,15 +185,15 @@ def err(e: Exception) -> str:
         return f"Error {code}: {msg}"
     return f"Error: {e}"
 
+
 def fmt_money(v) -> str:
     try:
         return f"${float(v)/1_000_000:.2f}"
     except Exception:
         return str(v)
 
+
 # ── Collection endpoint map ───────────────────────────────────────────────────
-# Bug 1 fix: Snapchat requires PUT to the collection endpoint
-# (e.g. adaccounts/{id}/campaigns) not the individual resource endpoint.
 COLLECTION_ENDPOINTS = {
     "campaigns": "adaccounts/{ad_account_id}/campaigns",
     "adsquads":  "adaccounts/{ad_account_id}/adsquads",
@@ -172,7 +226,7 @@ class StatsInput(BaseModel):
 
 class UpdateStatusInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
-    ad_account_id: str = Field(..., description="Snapchat Ad Account ID (UUID) — required for correct API endpoint")
+    ad_account_id: str = Field(..., description="Snapchat Ad Account ID")
     entity_type: str = Field(..., description="'campaigns', 'adsquads', or 'ads'")
     entity_id: str = Field(..., description="ID of the entity to update")
     status: str = Field(..., description="'ACTIVE' or 'PAUSED'")
@@ -181,35 +235,52 @@ class UpdateBudgetInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     ad_account_id: str = Field(..., description="Snapchat Ad Account ID (UUID)")
     campaign_id: str = Field(..., description="Campaign ID to update")
-    daily_budget_micro: Optional[int] = Field(None, description="New daily budget in micro-dollars (e.g. 50000000 = $50)")
-    lifetime_spend_cap_micro: Optional[int] = Field(None, description="Lifetime spend cap in micro-dollars (optional)")
+    daily_budget_micro: Optional[int] = Field(None, description="Daily budget in micro-dollars ($1 = 1,000,000)")
+    lifetime_spend_cap_micro: Optional[int] = Field(None, description="Lifetime spend cap in micro-dollars")
 
 # ── Tools ────────────────────────────────────────────────────────────────────
 
 @mcp.tool(name="snapchat_get_ad_accounts", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def snapchat_get_ad_accounts() -> str:
-    """List all Snapchat Ad Accounts linked to your credentials. Use this first to get your Ad Account ID."""
+    """
+    List all Snapchat Ad Accounts linked to this config.
+    When an org_id is saved in config, only that org's accounts are returned —
+    preventing cross-client data access in agency setups.
+    """
     try:
-        org_data = await snap_request("me/organizations")
-        orgs = org_data.get("organizations", [])
-        if not orgs:
-            return "No organizations found for this account."
+        org_id = get_org_id()
 
-        all_accounts = []
-        for org in orgs:
-            org_obj = org.get("organization", org)
-            org_id  = org_obj.get("id")
+        if org_id:
+            # Org is locked — skip /me/organizations, go directly to known org
             acc_data = await snap_request(f"organizations/{org_id}/adaccounts")
             accounts = acc_data.get("adaccounts", [])
+            all_accounts = []
             for a in accounts:
                 ac = a.get("adaccount", a)
                 ac["_org_id"] = org_id
                 all_accounts.append(ac)
+        else:
+            # No org locked — discover all (single-user fallback)
+            org_data = await snap_request("me/organizations")
+            orgs = org_data.get("organizations", [])
+            if not orgs:
+                return "No organizations found. Re-run auth_setup.py."
+            all_accounts = []
+            for org in orgs:
+                org_obj = org.get("organization", org)
+                oid = org_obj.get("id")
+                acc_data = await snap_request(f"organizations/{oid}/adaccounts")
+                for a in acc_data.get("adaccounts", []):
+                    ac = a.get("adaccount", a)
+                    ac["_org_id"] = oid
+                    all_accounts.append(ac)
 
         if not all_accounts:
             return "No ad accounts found."
 
         lines = ["## Your Snapchat Ad Accounts\n"]
+        if org_id:
+            lines.append(f"🔒 Scoped to org: `{org_id}`\n")
         for ac in all_accounts:
             lines.append(f"- **{ac.get('name', 'Unnamed')}**")
             lines.append(f"  - Ad Account ID: `{ac.get('id')}`")
@@ -223,16 +294,29 @@ async def snapchat_get_ad_accounts() -> str:
 
 @mcp.tool(name="snapchat_get_campaigns", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def snapchat_get_campaigns(params: AdAccountInput) -> str:
-    """List ALL campaigns for a Snapchat Ad Account with status and budget info. Fully paginated."""
+    """
+    List all campaigns for a Snapchat Ad Account with status and budget info.
+    Returns ACTIVE, PAUSED, and COMPLETED campaigns — excludes DELETED only.
+    Results cached for 5 minutes.
+    """
+    cache_key = f"campaigns:{params.ad_account_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
     try:
-        # Bug 3 fix: paginated fetch
         campaigns = await snap_request_all(
             f"adaccounts/{params.ad_account_id}/campaigns", "campaigns"
         )
+        # Exclude permanently deleted campaigns — they have no operational value
+        campaigns = [c for c in campaigns
+                     if c.get("campaign", c).get("status") != "DELETED"]
+
         if not campaigns:
             return "No campaigns found for this account."
+
         lines = [f"## Campaigns — Account {params.ad_account_id}\n"]
-        lines.append(f"Total: {len(campaigns)} campaigns\n")
+        lines.append(f"Total: {len(campaigns)} campaigns (DELETED excluded)\n")
         for c in campaigns:
             cp = c.get("campaign", c)
             lines.append(f"### {cp.get('name', 'Unnamed')}")
@@ -244,16 +328,26 @@ async def snapchat_get_campaigns(params: AdAccountInput) -> str:
             if cp.get("lifetime_spend_cap_micro"):
                 lines.append(f"- **Lifetime Cap**: {fmt_money(cp['lifetime_spend_cap_micro'])}")
             lines.append("")
-        return "\n".join(lines)
+
+        result = "\n".join(lines)
+        cache_set(cache_key, result)
+        return result
     except Exception as e:
         return err(e)
 
 
 @mcp.tool(name="snapchat_get_ad_squads", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def snapchat_get_ad_squads(params: AdSquadInput) -> str:
-    """List ALL Ad Squads (ad sets) for an account or specific campaign. Fully paginated."""
+    """
+    List all Ad Squads for an account or specific campaign.
+    Excludes DELETED. Results cached for 5 minutes.
+    """
+    cache_key = f"adsquads:{params.ad_account_id}:{params.campaign_id or 'all'}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
     try:
-        # Bug 3 fix: paginated fetch
         if params.campaign_id:
             squads = await snap_request_all(
                 f"campaigns/{params.campaign_id}/adsquads", "adsquads"
@@ -262,8 +356,13 @@ async def snapchat_get_ad_squads(params: AdSquadInput) -> str:
             squads = await snap_request_all(
                 f"adaccounts/{params.ad_account_id}/adsquads", "adsquads"
             )
+
+        squads = [s for s in squads
+                  if s.get("adsquad", s).get("status") != "DELETED"]
+
         if not squads:
             return "No ad squads found."
+
         lines = [f"## Ad Squads ({len(squads)} total)\n"]
         for s in squads:
             sq = s.get("adsquad", s)
@@ -278,21 +377,33 @@ async def snapchat_get_ad_squads(params: AdSquadInput) -> str:
             lines.append(f"- **Optimization Goal**: {sq.get('optimization_goal', 'N/A')}")
             lines.append(f"- **Placement**: {sq.get('placement_v2', {}).get('config', 'N/A')}")
             lines.append("")
-        return "\n".join(lines)
+
+        result = "\n".join(lines)
+        cache_set(cache_key, result)
+        return result
     except Exception as e:
         return err(e)
 
 
 @mcp.tool(name="snapchat_get_ads", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def snapchat_get_ads(params: AdAccountInput) -> str:
-    """List ALL Ads in an account with creative and status details. Fully paginated."""
+    """
+    List all Ads in an account. Excludes DELETED. Results cached for 5 minutes.
+    """
+    cache_key = f"ads:{params.ad_account_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
     try:
-        # Bug 3 fix: paginated fetch
         ads = await snap_request_all(
             f"adaccounts/{params.ad_account_id}/ads", "ads"
         )
+        ads = [a for a in ads if a.get("ad", a).get("status") != "DELETED"]
+
         if not ads:
             return "No ads found."
+
         lines = [f"## Ads ({len(ads)} total)\n"]
         for a in ads:
             ad = a.get("ad", a)
@@ -302,7 +413,10 @@ async def snapchat_get_ads(params: AdAccountInput) -> str:
             lines.append(f"- **Type**: {ad.get('type', 'N/A')}")
             lines.append(f"- **Ad Squad ID**: `{ad.get('ad_squad_id')}`")
             lines.append("")
-        return "\n".join(lines)
+
+        result = "\n".join(lines)
+        cache_set(cache_key, result)
+        return result
     except Exception as e:
         return err(e)
 
@@ -312,13 +426,13 @@ async def snapchat_get_performance_stats(params: StatsInput) -> str:
     """
     Get performance statistics for a campaign, ad squad, or ad.
     Returns: impressions, swipe-ups, spend, CTR, eCPM, video views, conversions, ROAS.
-
-    Args:
-        params.entity_type: 'campaigns', 'adsquads', or 'ads'
-        params.entity_id: the UUID of the entity
-        params.start_date / end_date: date range YYYY-MM-DD
-        params.granularity: DAY (default), TOTAL, or HOUR
+    Results cached per entity + date range for 5 minutes.
     """
+    cache_key = f"stats:{params.entity_type}:{params.entity_id}:{params.start_date}:{params.end_date}:{params.granularity}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
     try:
         endpoint = f"{params.entity_type}/{params.entity_id}/stats"
         query = {
@@ -372,7 +486,9 @@ async def snapchat_get_performance_stats(params: StatsInput) -> str:
             f"| 🎯 CPA | ${cpa:.2f} |",
             f"| 📡 eCPM | ${ecpm:.2f} |",
         ]
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        cache_set(cache_key, result)
+        return result
     except Exception as e:
         return err(e)
 
@@ -381,8 +497,13 @@ async def snapchat_get_performance_stats(params: StatsInput) -> str:
 async def snapchat_get_account_report(params: StatsInput) -> str:
     """
     Full account-level performance report across all campaigns for a date range.
-    Use this for a top-level health check of the whole Snapchat account.
+    Results cached per account + date range for 5 minutes.
     """
+    cache_key = f"report:{params.ad_account_id}:{params.start_date}:{params.end_date}:{params.granularity}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
     try:
         endpoint = f"adaccounts/{params.ad_account_id}/stats"
         query = {
@@ -436,7 +557,9 @@ async def snapchat_get_account_report(params: StatsInput) -> str:
             f"| 🎯 CPA | ${cpa:.2f} |",
             f"| 📡 eCPM | ${ecpm:.2f} |",
         ]
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        cache_set(cache_key, result)
+        return result
     except Exception as e:
         return err(e)
 
@@ -445,12 +568,7 @@ async def snapchat_get_account_report(params: StatsInput) -> str:
 async def snapchat_update_status(params: UpdateStatusInput) -> str:
     """
     Pause or activate a campaign, ad squad, or ad.
-
-    Args:
-        ad_account_id: required — needed for the correct Snapchat API collection endpoint
-        entity_type: 'campaigns', 'adsquads', or 'ads'
-        entity_id: the UUID to update
-        status: 'ACTIVE' or 'PAUSED'
+    Automatically clears cached data for the account after the update.
     """
     try:
         if params.status not in ("ACTIVE", "PAUSED"):
@@ -459,17 +577,17 @@ async def snapchat_update_status(params: UpdateStatusInput) -> str:
             return f"Error: entity_type must be one of: {list(COLLECTION_ENDPOINTS.keys())}"
 
         key = ENTITY_KEYS[params.entity_type]
-
-        # Fetch current full entity object
         data = await snap_request(f"{params.entity_type}/{params.entity_id}")
         entity = data.get(params.entity_type, [{}])[0].get(key, {})
         entity["status"] = params.status
 
-        # Bug 1 fix: PUT to the collection endpoint, not the individual resource
         collection = COLLECTION_ENDPOINTS[params.entity_type].format(
             ad_account_id=params.ad_account_id
         )
         await snap_request(collection, method="PUT", json={params.entity_type: [entity]})
+
+        # Invalidate cache so next read reflects the change immediately
+        cache_invalidate(params.ad_account_id)
 
         action = "▶️ Activated" if params.status == "ACTIVE" else "⏸️ Paused"
         return f"{action} {key} `{params.entity_id}` successfully."
@@ -481,9 +599,8 @@ async def snapchat_update_status(params: UpdateStatusInput) -> str:
 async def snapchat_update_campaign_budget(params: UpdateBudgetInput) -> str:
     """
     Update the daily budget or lifetime spend cap of a campaign.
-
-    daily_budget_micro and lifetime_spend_cap_micro are in micro-dollars:
     $1 = 1,000,000 micro-dollars. Example: $50/day = 50000000.
+    Automatically clears cached data for the account after the update.
     """
     try:
         data = await snap_request(f"campaigns/{params.campaign_id}")
@@ -495,12 +612,15 @@ async def snapchat_update_campaign_budget(params: UpdateBudgetInput) -> str:
         if params.lifetime_spend_cap_micro is not None:
             campaign["lifetime_spend_cap_micro"] = params.lifetime_spend_cap_micro
 
-        payload = {"campaigns": [campaign]}
         await snap_request(
             f"adaccounts/{params.ad_account_id}/campaigns",
             method="PUT",
-            json=payload,
+            json={"campaigns": [campaign]},
         )
+
+        # Invalidate cache so next read reflects the change immediately
+        cache_invalidate(params.ad_account_id)
+
         lines = [f"✅ Budget updated for campaign `{params.campaign_id}`"]
         if params.daily_budget_micro is not None:
             lines.append(f"- Daily Budget → {fmt_money(params.daily_budget_micro)}")
@@ -513,14 +633,19 @@ async def snapchat_update_campaign_budget(params: UpdateBudgetInput) -> str:
 
 @mcp.tool(name="snapchat_get_creatives", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def snapchat_get_creatives(params: AdAccountInput) -> str:
-    """List ALL creatives (ad formats, media, headlines) in your ad account. Fully paginated."""
+    """List all creatives in your ad account. Results cached for 5 minutes."""
+    cache_key = f"creatives:{params.ad_account_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
     try:
-        # Bug 3 fix: paginated fetch
         creatives = await snap_request_all(
             f"adaccounts/{params.ad_account_id}/creatives", "creatives"
         )
         if not creatives:
             return "No creatives found."
+
         lines = [f"## Creatives ({len(creatives)} total)\n"]
         for c in creatives:
             cr = c.get("creative", c)
@@ -531,7 +656,10 @@ async def snapchat_get_creatives(params: AdAccountInput) -> str:
             lines.append(f"- **Call to Action**: {cr.get('call_to_action', 'N/A')}")
             lines.append(f"- **Brand Name**: {cr.get('brand_name', 'N/A')}")
             lines.append("")
-        return "\n".join(lines)
+
+        result = "\n".join(lines)
+        cache_set(cache_key, result)
+        return result
     except Exception as e:
         return err(e)
 

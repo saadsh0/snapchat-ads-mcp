@@ -108,7 +108,7 @@ Or create a `.env` file (see `.env.example`).
 python auth_setup.py
 ```
 
-This opens Snapchat in your browser → you click Allow → you paste the redirect URL → tokens saved automatically. Never needed again.
+This opens Snapchat in your browser → you click Allow → you paste the redirect URL → your org is auto-detected and locked into config → tokens saved. Never needed again.
 
 ### Step 5 — Connect to Claude Desktop
 
@@ -189,6 +189,57 @@ Snapchat API uses micro-dollars: `$1 = 1,000,000`
 See [`AGENT_FLOWS.md`](./AGENT_FLOWS.md) for connecting this MCP to Antigravity agents for automated reporting and optimization workflows.
 
 ---
+
+
+---
+
+## Agency / Multi-Client Setup
+
+Each client gets their own isolated config with their own tokens and org ID.
+
+### Step 1 — Run auth once per client
+
+```bash
+python auth_setup.py --client skyline
+python auth_setup.py --client fantastic
+```
+
+Each run saves to  with org ID locked automatically.
+
+### Step 2 — Add one entry per client in claude_desktop_config.json
+
+```json
+{
+  mcpServers: {
+    snapchat-skyline: {
+      command: python3,
+      args: [/full/path/to/server.py],
+      env: {
+        SNAPCHAT_CLIENT_ID: your_app_id,
+        SNAPCHAT_CLIENT_SECRET: your_secret,
+        SNAPCHAT_CONFIG_FILE: /full/path/to/clients/skyline/config.json
+      }
+    },
+    snapchat-fantastic: {
+      command: python3,
+      args: [/full/path/to/server.py],
+      env: {
+        SNAPCHAT_CLIENT_ID: your_app_id,
+        SNAPCHAT_CLIENT_SECRET: your_secret,
+        SNAPCHAT_CONFIG_FILE: /full/path/to/clients/fantastic/config.json
+      }
+    }
+  }
+}
+```
+
+> ✅ One OAuth app (your Sigma Digital credentials) works for all clients.
+> Each client is fully isolated — wrong org access is blocked at the server level.
+
+### How it works in Claude
+
+You'll see  and  as separate tool sets.
+Tell Claude which client to use and it only touches that org's data.
 
 ## Troubleshooting
 
