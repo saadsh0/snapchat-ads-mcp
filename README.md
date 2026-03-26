@@ -145,7 +145,7 @@ Snapchat API uses micro-dollars: `$1 = 1,000,000`
 
 ## Antigravity / n8n Integration
 
-See [`ANTIGRAVITY_SETUP.md`](./ANTIGRAVITY_SETUP.md) for connecting this MCP to Antigravity agents for automated reporting and optimization workflows.
+See [`AGENT_FLOWS.md`](./AGENT_FLOWS.md) for connecting this MCP to Antigravity agents for automated reporting and optimization workflows.
 
 ---
 
