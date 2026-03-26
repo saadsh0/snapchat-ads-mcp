@@ -1,12 +1,12 @@
 # Snapchat Ads MCP — Suggested Agent Flows
 
-These are ideas for how you can combine this MCP with AI agents (Antigravity, n8n, Make, etc.) to automate Snapchat Ads workflows. These are starting points — adapt them to your stack and business logic.
+These are ideas for how you can combine this MCP with any AI agent platform to automate Snapchat Ads workflows. These are directional starting points — adapt them to your stack, thresholds, and business logic.
 
 ---
 
 ## Flow 1 — Daily Performance Monitor
 
-**Trigger**: Every morning at 9am
+**Trigger**: Every morning at 9am  
 **What it does**: Pulls yesterday's data, flags underperformers, pauses them, sends a summary
 
 ```
@@ -26,7 +26,7 @@ These are ideas for how you can combine this MCP with AI agents (Antigravity, n8
 
 ## Flow 2 — Budget Pacing Guard
 
-**Trigger**: Every 6 hours
+**Trigger**: Every 6 hours  
 **What it does**: Monitors daily spend pace, adjusts to avoid over/under-spending
 
 ```
@@ -44,7 +44,7 @@ These are ideas for how you can combine this MCP with AI agents (Antigravity, n8
 
 ## Flow 3 — Weekly Creative Performance Audit
 
-**Trigger**: Every Monday morning
+**Trigger**: Every Monday morning  
 **What it does**: Ranks all ads by swipe-up rate and screen time, kills bottom performers
 
 ```
@@ -64,7 +64,7 @@ These are ideas for how you can combine this MCP with AI agents (Antigravity, n8
 
 ## Flow 4 — Pre-Eid / Seasonal Push Automation
 
-**Trigger**: 7 days before a key date (Eid, National Day, etc.)
+**Trigger**: 7 days before a key date (Eid, National Day, etc.)  
 **What it does**: Ramps up budget on best-performing campaigns automatically
 
 ```
@@ -81,7 +81,7 @@ These are ideas for how you can combine this MCP with AI agents (Antigravity, n8
 
 ## Flow 5 — Multi-Account Agency Report
 
-**Trigger**: Weekly / Monthly
+**Trigger**: Weekly / Monthly  
 **What it does**: Pulls data across all client accounts and generates a consolidated report
 
 ```
@@ -100,7 +100,7 @@ These are ideas for how you can combine this MCP with AI agents (Antigravity, n8
 
 ## Flow 6 — Lead Follow-Up Trigger (Snapchat → CRM)
 
-**Trigger**: New lead from Snapchat Lead Gen form
+**Trigger**: New lead from Snapchat Lead Gen form  
 **What it does**: Captures lead, enriches it, sends to CRM, triggers WhatsApp follow-up
 
 ```
@@ -133,6 +133,7 @@ These are ideas for how you can combine this MCP with AI agents (Antigravity, n8
 
 ## Notes
 
-- These flows are directional — implementation depends on your agent platform (Antigravity, n8n, Make, etc.)
+- These flows work with any agent platform that supports MCP (Claude, n8n, Make, etc.)
 - Combine with other MCPs (Meta Ads, Google Ads, CRM) for cross-platform automation
 - All write actions (pause, update budget) should include a confirmation step or threshold logic to avoid unintended changes
+- For platform-specific setup, see the relevant integration guide in this repo
