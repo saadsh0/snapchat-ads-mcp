@@ -33,12 +33,53 @@ No CSV exports. No manual copy-paste. Just ask Claude in plain language.
 
 ---
 
+## Install
+
+### Option A — PyPI (Recommended, 1-click)
+
+```bash
+pip install snapchat-ads-mcp
+```
+
+Or run directly without installing (requires `uv`):
+
+```bash
+uvx snapchat-ads-mcp
+```
+
+Claude Desktop config with PyPI install:
+
+```json
+{
+  "mcpServers": {
+    "snapchat-ads": {
+      "command": "uvx",
+      "args": ["snapchat-ads-mcp"],
+      "env": {
+        "SNAPCHAT_CLIENT_ID": "your_client_id",
+        "SNAPCHAT_CLIENT_SECRET": "your_client_secret"
+      }
+    }
+  }
+}
+```
+
+### Option B — Manual Setup
+
+```bash
+git clone https://github.com/saadsh0/snapchat-ads-mcp
+cd snapchat-ads-mcp
+pip install -r requirements.txt
+```
+
+---
+
 ## Setup
 
 ### Step 1 — Clone & Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/snapchat-ads-mcp
+git clone https://github.com/saadsh0/snapchat-ads-mcp
 cd snapchat-ads-mcp
 pip install -r requirements.txt
 ```
@@ -47,7 +88,7 @@ pip install -r requirements.txt
 
 1. Go to [business.snapchat.com](https://business.snapchat.com)
 2. Navigate to **Business Details → OAuth Apps → New App**
-3. Set redirect URI to `https://example.com`
+3. Set redirect URI to `http://localhost:8080`
 4. Copy your **Client ID** and **Client Secret**
 
 > ⚠️ Use **Business Manager** to create the app — NOT the Developer Portal
@@ -67,7 +108,7 @@ Or create a `.env` file (see `.env.example`).
 python auth_setup.py
 ```
 
-This opens Snapchat in your browser → you authorize → paste the redirect URL → tokens saved automatically. Never needed again.
+This opens Snapchat in your browser → you click Allow → tokens are saved automatically. No copy-pasting. Never needed again.
 
 ### Step 5 — Connect to Claude Desktop
 

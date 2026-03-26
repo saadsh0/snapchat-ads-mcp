@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "snapchat-ads-mcp"
+version = "1.1.0"
+description = "MCP server for Snapchat Ads — analyze campaigns and take live actions from Claude AI"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Sigma Digital", email = "hello@sigmadigital.io" }]
+keywords = ["mcp", "snapchat", "ads", "claude", "ai", "marketing", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+snapchat-ads-mcp = "server:main"
+snapchat-ads-auth = "auth_setup:main"
+
+[project.urls]
+Homepage = "https://github.com/saadsh0/snapchat-ads-mcp"
+Repository = "https://github.com/saadsh0/snapchat-ads-mcp"
+"Bug Tracker" = "https://github.com/saadsh0/snapchat-ads-mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+include = [
+    "server.py",
+    "auth_setup.py",
+    "README.md",
+    "SETUP.md",
+    "AGENT_FLOWS.md",
+    "ANTIGRAVITY_RECOMMENDATIONS.md",
+    ".env.example",
+]

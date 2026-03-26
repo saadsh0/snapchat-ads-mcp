@@ -537,5 +537,10 @@ async def snapchat_get_creatives(params: AdAccountInput) -> str:
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main():
+    """Entry point for PyPI package / uvx installation."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
