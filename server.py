@@ -509,10 +509,33 @@ async def snapchat_get_performance_stats(params: StatsInput) -> str:
         return err(e)
 
 
+async def _parse_stats_from_response(data: dict) -> dict:
+    """Parse Snapchat stats response into a flat totals dict (handles TOTAL and DAY/HOUR)."""
+    total = {}
+    if "total_stats" in data:
+        stat_block = data["total_stats"][0].get("total_stat", {})
+        raw = stat_block.get("stats", {})
+        for k, v in raw.items():
+            if isinstance(v, (int, float)):
+                total[k] = v
+    elif "timeseries_stats" in data:
+        ts = data["timeseries_stats"]
+        if ts:
+            stat_block = ts[0].get("timeseries_stat", {})
+            for row in stat_block.get("timeseries", [stat_block]):
+                for k, v in row.get("stats", row).items():
+                    if isinstance(v, (int, float)):
+                        total[k] = total.get(k, 0) + v
+    return total
+
+
 @mcp.tool(name="snapchat_get_account_report", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def snapchat_get_account_report(params: StatsInput) -> str:
     """
-    Full account-level performance report across all campaigns for a date range.
+    Full account-level performance report: loops ALL campaigns, pulls stats for each,
+    aggregates totals and returns a ranked per-campaign breakdown.
+    This is the correct approach — Snapchat's account-level stats endpoint is restricted
+    to reach fields only, so we fan out per-campaign (same pattern as Meta Ads API).
     Results cached per account + date range for 5 minutes.
     """
     cache_key = f"report:{params.ad_account_id}:{params.start_date}:{params.end_date}:{params.granularity}"
@@ -521,39 +544,78 @@ async def snapchat_get_account_report(params: StatsInput) -> str:
         return cached
 
     try:
-        endpoint = f"adaccounts/{params.ad_account_id}/stats"
+        # Step 1 — fetch all campaigns (same as Meta's ad-level loop)
+        campaigns_raw = await snap_request_all(
+            f"adaccounts/{params.ad_account_id}/campaigns", "campaigns"
+        )
+        campaigns = [c for c in campaigns_raw
+                     if c.get("campaign", c).get("status") != "DELETED"]
+
+        if not campaigns:
+            return "No campaigns found for this account."
+
         query = {
             "fields": (
-                "impressions,swipes,spend,swipe_up_percent,video_views,"
-                "conversion_purchases,conversion_purchases_value,frequency"
+                "impressions,swipes,spend,video_views,"
+                "screen_time_millis,conversion_purchases,conversion_purchases_value"
             ),
             "granularity": params.granularity,
             "start_time":  params.start_date,
             "end_time":    params.end_date,
         }
-        data = await snap_request(endpoint, params=query)
 
-        total = {}
-        if "total_stats" in data:
-            stat_block = data["total_stats"][0].get("total_stat", {})
-            for k, v in stat_block.get("stats", {}).items():
-                if isinstance(v, (int, float)):
-                    total[k] = v
-        elif "timeseries_stats" in data:
-            ts = data["timeseries_stats"]
-            stats = ts[0].get("timeseries_stat", {}) if ts else {}
-            for row in stats.get("timeseries", [stats]):
-                for k, v in row.get("stats", row).items():
-                    if isinstance(v, (int, float)):
-                        total[k] = total.get(k, 0) + v
+        # Step 2 — fan out: one stats call per campaign (Snapchat has no bulk endpoint)
+        account_total: dict = {}
+        campaign_rows: list = []
 
-        spend     = total.get("spend", 0)
-        imps      = total.get("impressions", 0)
-        swipes    = total.get("swipes", 0)
-        views     = total.get("video_views", 0)
-        purchases = total.get("conversion_purchases", 0)
-        rev       = total.get("conversion_purchases_value", 0)
-        freq      = total.get("frequency", 0)
+        for c in campaigns:
+            cp = c.get("campaign", c)
+            cid  = cp.get("id")
+            name = cp.get("name", "Unnamed")
+            try:
+                data = await snap_request(f"campaigns/{cid}/stats", params=query)
+                ctotal = await _parse_stats_from_response(data)
+            except Exception:
+                ctotal = {}
+
+            cspend = ctotal.get("spend", 0)
+            cimps  = ctotal.get("impressions", 0)
+            if cspend == 0 and cimps == 0:
+                continue  # skip campaigns with no activity in this period
+
+            # Accumulate account totals
+            for k, v in ctotal.items():
+                account_total[k] = account_total.get(k, 0) + v
+
+            cswipes = ctotal.get("swipes", 0)
+            cviews  = ctotal.get("video_views", 0)
+            cpurch  = ctotal.get("conversion_purchases", 0)
+            cctr    = (cswipes / cimps * 100) if cimps else 0
+            ccpa    = ((cspend / 1_000_000) / cpurch) if cpurch else 0
+            campaign_rows.append({
+                "name":      name,
+                "spend":     cspend,
+                "imps":      cimps,
+                "swipes":    cswipes,
+                "views":     cviews,
+                "purchases": cpurch,
+                "ctr":       cctr,
+                "cpa":       ccpa,
+            })
+
+        if not campaign_rows:
+            return f"No campaign activity found for account {params.ad_account_id} in {params.start_date} → {params.end_date}."
+
+        # Sort by spend descending
+        campaign_rows.sort(key=lambda r: r["spend"], reverse=True)
+
+        # Step 3 — build output
+        spend     = account_total.get("spend", 0)
+        imps      = account_total.get("impressions", 0)
+        swipes    = account_total.get("swipes", 0)
+        views     = account_total.get("video_views", 0)
+        purchases = account_total.get("conversion_purchases", 0)
+        rev       = account_total.get("conversion_purchases_value", 0)
 
         ctr  = (swipes / imps * 100) if imps else 0
         ecpm = (spend / imps * 1000 / 1_000_000) if imps else 0
@@ -562,13 +624,13 @@ async def snapchat_get_account_report(params: StatsInput) -> str:
 
         lines = [
             f"# 📊 Snapchat Account Report",
-            f"**Period**: {params.start_date} → {params.end_date}\n",
-            f"## Summary",
+            f"**Period**: {params.start_date} → {params.end_date}",
+            f"**Active campaigns in period**: {len(campaign_rows)}\n",
+            f"## Account Totals",
             f"| Metric | Value |",
             f"|--------|-------|",
             f"| 💰 Total Spend | {fmt_money(spend)} |",
             f"| 👁 Impressions | {imps:,} |",
-            f"| 🔁 Frequency | {freq:.1f}x |",
             f"| 👆 Swipe-Ups | {swipes:,} |",
             f"| 📊 Swipe-Up Rate | {ctr:.2f}% |",
             f"| 📺 Video Views | {views:,} |",
@@ -576,8 +638,17 @@ async def snapchat_get_account_report(params: StatsInput) -> str:
             f"| 💵 Revenue | {fmt_money(rev * 1_000_000)} |",
             f"| 📈 ROAS | {roas:.2f}x |",
             f"| 🎯 CPA | ${cpa:.2f} |",
-            f"| 📡 eCPM | ${ecpm:.2f} |",
+            f"| 📡 eCPM | ${ecpm:.2f} |\n",
+            f"## Campaign Breakdown (by spend)",
+            f"| Campaign | Spend | Imps | Swipes | CTR | Purchases | CPA |",
+            f"|----------|-------|------|--------|-----|-----------|-----|",
         ]
+        for r in campaign_rows:
+            lines.append(
+                f"| {r['name'][:40]} | {fmt_money(r['spend'])} | {r['imps']:,} | "
+                f"{r['swipes']:,} | {r['ctr']:.1f}% | {r['purchases']:,} | ${r['cpa']:.2f} |"
+            )
+
         result = "\n".join(lines)
         cache_set(cache_key, result)
         return result
