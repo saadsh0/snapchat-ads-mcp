@@ -445,16 +445,32 @@ async def snapchat_get_performance_stats(params: StatsInput) -> str:
             "end_time":    params.end_date,
         }
         data = await snap_request(endpoint, params=query)
-        timeseries = data.get("timeseries_stats", [{}])
-        if not timeseries:
+
+        total = {}
+
+        # Snapchat returns different structures based on granularity:
+        # TOTAL -> total_stats[].total_stat.stats (flat dict)
+        # DAY/HOUR -> timeseries_stats[].timeseries_stat.timeseries[].stats
+        if "total_stats" in data:
+            stat_block = data["total_stats"][0].get("total_stat", {})
+            raw = stat_block.get("stats", {})
+            for k, v in raw.items():
+                if isinstance(v, (int, float)):
+                    total[k] = v
+        elif "timeseries_stats" in data:
+            ts = data["timeseries_stats"]
+            if not ts:
+                return "No stats returned for this period."
+            stat_block = ts[0].get("timeseries_stat", {})
+            for row in stat_block.get("timeseries", [stat_block]):
+                for k, v in row.get("stats", row).items():
+                    if isinstance(v, (int, float)):
+                        total[k] = total.get(k, 0) + v
+        else:
             return "No stats returned for this period."
 
-        stats = timeseries[0].get("timeseries_stat", {})
-        total = {}
-        for row in stats.get("timeseries", [stats]):
-            for k, v in row.get("stats", row).items():
-                if isinstance(v, (int, float)):
-                    total[k] = total.get(k, 0) + v
+        if not total or total.get("impressions", 0) == 0 and total.get("spend", 0) == 0:
+            return f"No activity found for this entity in {params.start_date} to {params.end_date}."
 
         spend     = total.get("spend", 0)
         imps      = total.get("impressions", 0)
@@ -516,15 +532,20 @@ async def snapchat_get_account_report(params: StatsInput) -> str:
             "end_time":    params.end_date,
         }
         data = await snap_request(endpoint, params=query)
-        timeseries = data.get("timeseries_stats", [{}])
-        stats = timeseries[0].get("timeseries_stat", {}) if timeseries else {}
-        rows  = stats.get("timeseries", [stats])
 
         total = {}
-        for row in rows:
-            for k, v in row.get("stats", row).items():
+        if "total_stats" in data:
+            stat_block = data["total_stats"][0].get("total_stat", {})
+            for k, v in stat_block.get("stats", {}).items():
                 if isinstance(v, (int, float)):
-                    total[k] = total.get(k, 0) + v
+                    total[k] = v
+        elif "timeseries_stats" in data:
+            ts = data["timeseries_stats"]
+            stats = ts[0].get("timeseries_stat", {}) if ts else {}
+            for row in stats.get("timeseries", [stats]):
+                for k, v in row.get("stats", row).items():
+                    if isinstance(v, (int, float)):
+                        total[k] = total.get(k, 0) + v
 
         spend     = total.get("spend", 0)
         imps      = total.get("impressions", 0)
